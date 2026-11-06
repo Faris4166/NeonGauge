@@ -5,7 +5,10 @@ edition = "2021"
 description = "Tiny pixel-art desktop tab that shows your Claude usage limits"
 
 [dependencies]
-eframe = "0.29"
+# accesskit (screen-reader bridge) is left out: it adds threads and per-frame work.
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+# Direct dependency only to keep winit's default features, which eframe's defaults turned on.
+winit = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,3 +28,6 @@ tray-icon = "0.26.1"
 
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Media_Audio", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
+[build-dependencies]
+embed-resource = "3.0.12"

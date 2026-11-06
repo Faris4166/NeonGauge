@@ -94,7 +94,7 @@ cargo +stable-x86_64-pc-windows-gnu build --release
 
 ## Layout
 
-- `src/icon.rs`: the arc-gauge window icon, drawn in code
+- `src/icon.rs`: window and tray icons (PNG renders of `assets/logo.svg`); `build.rs` embeds `assets/icon.ico` into the Windows exe
 - `src/api.rs`: credentials, usage API, reset-time formatting
 - `src/pixel.rs`: dot canvas, neon palette, 3x5 bitmap font
 - `src/mascot.rs`: sprite, mood faces and frame-based animation

@@ -1,12 +1,12 @@
 //! Reads the Claude Code OAuth token and queries Anthropic's usage endpoint.
 
-use chrono::{DateTime, FixedOffset, Utc};
-use serde::Deserialize;
+use chrono::{DateTime, FixedOffset, Local, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf, time::Duration};
 
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct LimitWindow {
     pub utilization: Option<f64>,
     pub resets_at: Option<String>,
@@ -24,19 +24,19 @@ impl LimitWindow {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BreakdownRow {
     pub display_name: String,
     pub percent: f64,
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Breakdown {
     #[serde(default)]
     pub rows: Vec<BreakdownRow>,
 }
 
-#[derive(Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Usage {
     pub five_hour: Option<LimitWindow>,
     pub seven_day: Option<LimitWindow>,
@@ -45,7 +45,7 @@ pub struct Usage {
     pub seven_day_breakdown: Option<Breakdown>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Snapshot {
     pub usage: Usage,
     pub plan: Option<String>,
@@ -56,6 +56,10 @@ pub struct Snapshot {
 pub struct FetchError {
     pub short: String,
     pub detail: String,
+    /// Seconds the server asked us to wait (HTTP 429 `Retry-After`).
+    pub retry_after: Option<u64>,
+    /// True for HTTP 429: the worker backs off instead of retrying on schedule.
+    pub rate_limited: bool,
 }
 
 impl FetchError {
@@ -63,6 +67,8 @@ impl FetchError {
         Self {
             short: short.into(),
             detail: detail.into(),
+            retry_after: None,
+            rate_limited: false,
         }
     }
 }
@@ -174,10 +180,16 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
             ))
         }
         429 => {
-            return Err(FetchError::new(
-                "RATE LIMITED",
-                "Too many requests - will retry automatically",
-            ))
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok());
+            return Err(FetchError {
+                retry_after,
+                rate_limited: true,
+                ..FetchError::new("RATE LIMITED", "Too many requests - backing off before the next try")
+            });
         }
         code => {
             return Err(FetchError::new(
@@ -195,6 +207,36 @@ pub fn fetch() -> Result<Snapshot, FetchError> {
         usage,
         plan: oauth.subscription_type,
     })
+}
+
+/// The last good reading, kept on disk so a restart shows numbers right away
+/// and does not have to hit the API again immediately.
+#[derive(Serialize, Deserialize)]
+struct Cached {
+    fetched_at: i64,
+    snapshot: Snapshot,
+}
+
+fn cache_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("NeonGauge").join("last-usage.json"))
+}
+
+pub fn load_cache() -> Option<(Snapshot, DateTime<Local>)> {
+    let raw = fs::read_to_string(cache_path()?).ok()?;
+    let c: Cached = serde_json::from_str(&raw).ok()?;
+    let at = Local.timestamp_opt(c.fetched_at, 0).single()?;
+    Some((c.snapshot, at))
+}
+
+pub fn save_cache(snapshot: &Snapshot, at: DateTime<Local>) {
+    let Some(path) = cache_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let c = Cached { fetched_at: at.timestamp(), snapshot: snapshot.clone() };
+    if let Ok(json) = serde_json::to_string(&c) {
+        let _ = fs::write(path, json);
+    }
 }
 
 fn until(when: DateTime<FixedOffset>) -> (i64, i64, i64) {

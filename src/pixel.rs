@@ -1,7 +1,8 @@
 //! A tiny pixel canvas: everything is drawn on a grid of square "dots",
 //! plus a hand-made 3x5 bitmap font.
 
-use eframe::egui::{vec2, Color32, Painter, Pos2, Rect};
+use eframe::egui::Color32;
+use std::cell::RefCell;
 
 /// Neon tech palette.
 pub mod pal {
@@ -22,22 +23,61 @@ pub mod pal {
     pub const RED: Color32 = Color32::from_rgb(255, 46, 77);
 }
 
+/// A CPU framebuffer of `w` x `h` "dots". Everything is drawn here first, then
+/// uploaded as one small texture per frame. Far cheaper than handing egui
+/// thousands of separate rectangles to tessellate every frame.
 pub struct Canvas {
-    pub painter: Painter,
-    pub origin: Pos2,
-    pub dot: f32,
+    pub w: i32,
+    pub h: i32,
+    buf: RefCell<Vec<Color32>>,
+}
+
+/// `src` over `dst`, both premultiplied (as `Color32` is).
+fn blend(dst: Color32, src: Color32) -> Color32 {
+    let a = src.a() as u32;
+    if a == 255 {
+        return src;
+    }
+    if a == 0 && src == Color32::TRANSPARENT {
+        return dst;
+    }
+    let inv = 255 - a;
+    let mix = |s: u8, d: u8| (s as u32 + (d as u32 * inv + 127) / 255).min(255) as u8;
+    Color32::from_rgba_premultiplied(
+        mix(src.r(), dst.r()),
+        mix(src.g(), dst.g()),
+        mix(src.b(), dst.b()),
+        mix(src.a(), dst.a()),
+    )
 }
 
 impl Canvas {
-    /// Fill a `w` x `h` block of dots at grid position (`x`, `y`).
+    pub fn new(w: i32, h: i32) -> Self {
+        Self {
+            w,
+            h,
+            buf: RefCell::new(vec![Color32::TRANSPARENT; (w * h) as usize]),
+        }
+    }
+
+    pub fn clear(&self) {
+        self.buf.borrow_mut().fill(Color32::TRANSPARENT);
+    }
+
+    /// Fill a `w` x `h` block of dots at grid position (`x`, `y`), clipped to the canvas.
     pub fn px(&self, x: i32, y: i32, w: i32, h: i32, color: Color32) {
-        if w <= 0 || h <= 0 {
+        let (x0, y0) = (x.max(0), y.max(0));
+        let (x1, y1) = ((x + w).min(self.w), (y + h).min(self.h));
+        if x0 >= x1 || y0 >= y1 {
             return;
         }
-        let min = self.origin + vec2(x as f32 * self.dot, y as f32 * self.dot);
-        let size = vec2(w as f32 * self.dot, h as f32 * self.dot);
-        self.painter
-            .rect_filled(Rect::from_min_size(min, size), 0.0, color);
+        let mut buf = self.buf.borrow_mut();
+        for yy in y0..y1 {
+            let row = (yy * self.w) as usize;
+            for p in &mut buf[row + x0 as usize..row + x1 as usize] {
+                *p = blend(*p, color);
+            }
+        }
     }
 
     /// Draw text with the 3x5 font; each glyph advances 4 dots.
@@ -57,12 +97,8 @@ impl Canvas {
         }
     }
 
-    /// Screen position -> grid position.
-    pub fn to_dot(&self, p: Pos2) -> (i32, i32) {
-        (
-            ((p.x - self.origin.x) / self.dot).floor() as i32,
-            ((p.y - self.origin.y) / self.dot).floor() as i32,
-        )
+    pub fn pixels(&self) -> std::cell::Ref<'_, Vec<Color32>> {
+        self.buf.borrow()
     }
 }
 
@@ -121,4 +157,31 @@ fn glyph(c: char) -> Option<[u8; 5]> {
         ' ' => [0; 5],
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn px_clips_and_overwrites_opaque() {
+        let c = Canvas::new(4, 3);
+        c.px(-2, -2, 4, 4, pal::CYAN);
+        c.px(3, 2, 10, 10, pal::RED);
+        let p = c.pixels();
+        assert_eq!(p[0], pal::CYAN);
+        assert_eq!(p[5], pal::CYAN);
+        assert_eq!(p[2], Color32::TRANSPARENT);
+        assert_eq!(p[11], pal::RED);
+    }
+
+    #[test]
+    fn blend_matches_premultiplied_over() {
+        let half = pal::CYAN.gamma_multiply(0.5);
+        let out = blend(pal::BG, half);
+        assert_eq!(out.a(), 255);
+        // Halfway-ish between BG and CYAN on every channel.
+        assert!(out.g() > pal::BG.g() && out.g() < pal::CYAN.g());
+        assert_eq!(blend(pal::BG, Color32::TRANSPARENT), pal::BG);
+    }
 }

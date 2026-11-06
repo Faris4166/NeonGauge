@@ -166,7 +166,7 @@ mod tray_impl {
         ])
         .map_err(|e| e.to_string())?;
 
-        let rgba = crate::icon::rgba(1);
+        let rgba = crate::icon::tray();
         let icon = tray_icon::Icon::from_rgba(rgba.rgba, rgba.width, rgba.height)
             .map_err(|e| e.to_string())?;
         let tray = TrayIconBuilder::new()

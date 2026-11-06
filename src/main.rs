@@ -43,6 +43,12 @@ const PCT_RIGHT: i32 = 99;
 /// The plan badge must end before the "?" button.
 const PLAN_MAX_CHARS: usize = 3;
 
+/// Animation tick: the gauge animates at 30 fps.
+const TICK: f32 = 1.0 / 30.0;
+/// How far ahead (in ticks) to search for the next visible change. Also caps
+/// the idle wake-up interval, so countdown text updates within a second.
+const LOOKAHEAD_TICKS: u32 = 30;
+
 /// Settings are written to disk once they have been stable this long
 /// (sliders would otherwise write on every frame).
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
@@ -93,6 +99,13 @@ struct App {
     demo: Option<String>,
     /// (pixels_per_point, scale) the window was last sized for.
     sized_for: (f32, f32),
+    /// The gauge is drawn into this CPU buffer, then uploaded as one texture.
+    canvas: Canvas,
+    /// Scratch canvas for rendering future ticks to find the next change.
+    lookahead: Canvas,
+    canvas_tex: Option<egui::TextureHandle>,
+    /// What was last uploaded, so unchanged frames skip the upload.
+    last_pixels: Vec<Color32>,
 }
 
 fn tray_text(snap: &Snapshot) -> String {
@@ -125,6 +138,48 @@ fn spawn_worker(
         let mut alerts = alerts::Alerts::default();
         let mut manual = false;
         let mut had_error = false;
+        // Extra wait after HTTP 429, doubled on each repeat, reset on success.
+        let mut backoff: Option<u64> = None;
+
+        // Wait until `done(elapsed)` is true or a manual refresh arrives.
+        // Some(true) = manual, Some(false) = timed out, None = the app quit.
+        let wait = |done: &dyn Fn(Duration) -> bool| -> Option<bool> {
+            let started = Instant::now();
+            let r = loop {
+                if done(started.elapsed()) {
+                    break Some(false);
+                }
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(()) => break Some(true),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            };
+            while rx.try_recv().is_ok() {}
+            r
+        };
+
+        // Show the last good reading at once. If it is fresh, wait out the
+        // rest of the interval instead of asking the API again on every launch.
+        if let Some((snap, at)) = api::load_cache() {
+            *tray_tip.lock().unwrap() = tray_text(&snap);
+            {
+                let mut sh = shared.lock().unwrap();
+                sh.snap = Some(snap);
+                sh.updated = Some(at);
+            }
+            ctx.request_repaint();
+            let age = (Local::now() - at).to_std().unwrap_or(Duration::MAX);
+            let every = Duration::from_secs(cfg.lock().unwrap().refresh_secs);
+            let first_wait = every.saturating_sub(age);
+            if !first_wait.is_zero() {
+                match wait(&|e| e >= first_wait) {
+                    Some(m) => manual = m,
+                    None => return,
+                }
+            }
+        }
+
         loop {
             shared.lock().unwrap().loading = true;
             ctx.request_repaint();
@@ -141,20 +196,29 @@ fn spawn_worker(
                             weekly: u.seven_day.as_ref().map_or(0.0, |w| w.percent()),
                         });
                     }
+                    api::save_cache(snap, Local::now());
                     alerts.check(u.five_hour.as_ref(), u.seven_day.as_ref(), &s);
                     if manual && s.ui_sfx {
                         sfx::play(Sfx::Refresh, s.volume);
                     }
                     *tray_tip.lock().unwrap() = tray_text(snap);
                     had_error = false;
+                    backoff = None;
                 }
-                Err(_) => {
+                Err(e) => {
                     if (!had_error || manual) && s.ui_sfx {
                         sfx::play(Sfx::Error, s.volume);
                     }
                     had_error = true;
+                    if e.rate_limited {
+                        // Retry-After if given, else 2, 4, 8 ... minutes, capped at 15.
+                        let next = backoff.map_or(120, |b| (b * 2).min(900));
+                        backoff = Some(e.retry_after.unwrap_or(0).max(next));
+                    }
                 }
             }
+            // Seconds until the next automatic try (at least the refresh interval).
+            let pause = backoff.unwrap_or(0);
             {
                 let mut sh = shared.lock().unwrap();
                 sh.loading = false;
@@ -164,27 +228,26 @@ fn spawn_worker(
                         sh.error = None;
                         sh.updated = Some(Local::now());
                     }
-                    Err(e) => sh.error = Some(e),
+                    Err(mut e) => {
+                        let every = s.refresh_secs.max(pause);
+                        let at = Local::now() + chrono::Duration::seconds(every as i64);
+                        e.detail = format!("{} - next try at {}", e.detail, at.format("%H:%M"));
+                        sh.error = Some(e);
+                    }
                 }
             }
             ctx.request_repaint();
 
             // Wait for the interval (re-read every second so changes apply
-            // right away) or for a manual refresh.
-            let waited = Instant::now();
-            manual = loop {
-                match rx.recv_timeout(Duration::from_secs(1)) {
-                    Ok(()) => break true,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let every = cfg.lock().unwrap().refresh_secs;
-                        if waited.elapsed() >= Duration::from_secs(every) {
-                            break false;
-                        }
-                    }
-                }
-            };
-            while rx.try_recv().is_ok() {}
+            // right away), or the back-off, or a manual refresh.
+            let cfg = cfg.clone();
+            match wait(&move |elapsed| {
+                let every = cfg.lock().unwrap().refresh_secs.max(pause);
+                elapsed >= Duration::from_secs(every)
+            }) {
+                Some(m) => manual = m,
+                None => return,
+            }
         }
     });
     tx
@@ -298,6 +361,10 @@ impl App {
                 .or_else(|_| std::env::var("CLAUDE_LIMIT_DEMO"))
                 .ok(),
             sized_for: (0.0, 0.0),
+            canvas: Canvas::new(GRID_W, GRID_H),
+            lookahead: Canvas::new(GRID_W, GRID_H),
+            canvas_tex: None,
+            last_pixels: Vec::new(),
         }
     }
 
@@ -657,15 +724,98 @@ fn draw_frame(c: &Canvas, col: Color32) {
     }
 }
 
-/// CRT-style scanlines over the whole canvas.
-fn draw_scanlines(c: &Canvas) {
+/// CRT-style scanlines over the whole canvas. They are thinner than a dot, so
+/// they are painted on top of the canvas texture rather than baked into it.
+fn draw_scanlines(painter: &egui::Painter, origin: Pos2, dot: f32) {
     let line = Color32::from_black_alpha(40);
     for y in (1..GRID_H).step_by(2) {
-        let min = c.origin + vec2(0.0, y as f32 * c.dot);
-        let size = vec2(GRID_W as f32 * c.dot, (c.dot * 0.34).max(1.0));
-        c.painter
-            .rect_filled(Rect::from_min_size(min, size), 0.0, line);
+        let min = origin + vec2(0.0, y as f32 * dot);
+        let size = vec2(GRID_W as f32 * dot, (dot * 0.34).max(1.0));
+        painter.rect_filled(Rect::from_min_size(min, size), 0.0, line);
     }
+}
+
+/// Everything the gauge picture depends on besides time.
+struct Scene {
+    mood: Mood,
+    plan: Option<String>,
+    hover: Option<(i32, i32)>,
+    error_short: Option<String>,
+    has_data: bool,
+    loading: bool,
+    session_pct: f32,
+    weekly_pct: f32,
+    session: Option<LimitWindow>,
+    weekly: Option<LimitWindow>,
+}
+
+/// Draw the whole gauge for time `t`. Pure apart from the countdown clock, so
+/// it can also render future ticks to find the next frame that changes.
+fn draw_scene(c: &Canvas, s: &Scene, t: f32) {
+    c.clear();
+    let over = |b| s.hover.is_some_and(|h| in_box(h, b));
+
+    // Frame pulses in the mood colour, in 8 brightness steps (a smooth pulse
+    // would change every single frame and keep the GPU busy).
+    let pulse = 0.65 + 0.35 * (((t * 2.5).sin().abs() * 8.0).round() / 8.0);
+    let accent = s.mood.accent();
+    draw_frame(c, accent.gamma_multiply(pulse));
+
+    mascot::draw(c, 4, 7, s.mood, t);
+
+    // Title + plan badge (trimmed so it never runs into the buttons).
+    c.text(INFO_X, 4, "CLAUDE", pal::CYAN);
+    if let Some(plan) = &s.plan {
+        let plan: String = plan.to_uppercase().chars().take(PLAN_MAX_CHARS).collect();
+        let bx = INFO_X + text_width("CLAUDE") + 3;
+        c.px(bx - 1, 3, text_width(&plan) + 2, 7, pal::MAGENTA);
+        c.text(bx, 4, &plan, pal::BG);
+    }
+    draw_button(c, BTN_INFO, "?", over(BTN_INFO), pal::YELLOW);
+    draw_button(c, BTN_REFRESH, "R", over(BTN_REFRESH), pal::CYAN);
+    draw_button(c, BTN_CLOSE, "X", over(BTN_CLOSE), pal::RED);
+
+    // Status line: mood, loading, or error (alternating with the mood if we have data).
+    let (msg, col) = match (&s.error_short, s.has_data) {
+        (Some(e), false) => (format!("! {e}"), pal::RED),
+        (Some(e), true) if (t / 2.0) as i32 % 2 == 1 => (format!("! {e}"), pal::RED),
+        (None, false) => {
+            let dots = ".".repeat((t * 3.0) as usize % 4);
+            (format!("> SYNCING{dots}"), pal::CYAN)
+        }
+        // When burnt out, alternate with the time the governing limit comes back.
+        _ if s.mood == Mood::Dead && (t / 2.0) as i32 % 2 == 1 => {
+            let gov = if s.weekly_pct > s.session_pct {
+                s.weekly.as_ref().and_then(|w| w.resets_at()).map(|r| reset_clock(r, true))
+            } else {
+                s.session.as_ref().and_then(|w| w.resets_at()).map(|r| reset_clock(r, false))
+            };
+            match gov {
+                Some(at) => (format!("> BACK {at}"), accent),
+                None => (mood_message(s.mood).to_string(), accent),
+            }
+        }
+        _ => (mood_message(s.mood).to_string(), accent),
+    };
+    let visible = s.mood != Mood::Panic || (t * 3.0) as i32 % 3 != 0;
+    if visible {
+        c.text(INFO_X, 13, &msg, col);
+    }
+    // Tiny activity blip left of the buttons while a refresh is running.
+    if s.loading && s.has_data && (t * 6.0) as i32 % 2 == 0 {
+        c.px(BTN_INFO.0 - 2, 6, 1, 1, pal::CYAN);
+    }
+
+    draw_limit_row(c, 21, "5H", s.session_pct, s.session.as_ref(), false, t);
+    draw_limit_row(c, 34, "7D", s.weekly_pct, s.weekly.as_ref(), true, t);
+}
+
+/// Screen position -> canvas dot.
+fn to_dot(origin: Pos2, dot: f32, p: Pos2) -> (i32, i32) {
+    (
+        ((p.x - origin.x) / dot).floor() as i32,
+        ((p.y - origin.y) / dot).floor() as i32,
+    )
 }
 
 /// Full readout of the current limits; used by the "?" tooltip and the History window.
@@ -805,6 +955,14 @@ impl eframe::App for App {
         self.shown_session += (target_s - self.shown_session) * ease;
         self.shown_weekly += (target_w - self.shown_weekly) * ease;
 
+        // Settle the eased numbers so a still gauge produces identical frames.
+        let easing = (target_s - self.shown_session).abs() > 0.05
+            || (target_w - self.shown_weekly).abs() > 0.05;
+        if !easing {
+            self.shown_session = target_s;
+            self.shown_weekly = target_w;
+        }
+
         let governing = self.shown_session.max(self.shown_weekly);
         let has_data = snap.is_some() || self.demo.is_some();
         let mood = if !has_data && error.is_some() {
@@ -813,9 +971,14 @@ impl eframe::App for App {
             Mood::from_percent(governing)
         };
 
+        // Animation runs on a fixed 30 fps grid of ticks since start.
+        let tick = (t / TICK).floor();
+        let t_frame = tick * TICK;
+
         let mut open_history = false;
         let mut open_settings = false;
         let mut hide = false;
+        let mut next_change_ticks = 1u32;
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
@@ -829,67 +992,64 @@ impl eframe::App for App {
                 let resp = ui.interact(rect, Id::new("canvas"), Sense::click_and_drag());
                 let mut painter = ui.painter().clone();
                 painter.set_opacity(self.cfg.opacity);
-                let canvas = Canvas { painter, origin, dot };
-                let hover = resp.hover_pos().map(|p| canvas.to_dot(p));
+                let hover = resp.hover_pos().map(|p| to_dot(origin, dot, p));
                 let over = |b| hover.is_some_and(|h| in_box(h, b));
                 let over_any = BUTTONS.iter().any(|&b| over(b));
 
-                // Frame pulses gently in the mood colour.
-                let pulse = 0.65 + 0.35 * (t * 2.5).sin().abs();
-                let accent = mood.accent();
-                draw_frame(&canvas, accent.gamma_multiply(pulse));
+                let scene = Scene {
+                    mood,
+                    plan: snap.as_ref().and_then(|s| s.plan.clone()),
+                    hover,
+                    error_short: error.as_ref().map(|e| e.short.clone()),
+                    has_data,
+                    loading,
+                    session_pct: self.shown_session,
+                    weekly_pct: self.shown_weekly,
+                    session: session.clone(),
+                    weekly: weekly.clone(),
+                };
+                draw_scene(&self.canvas, &scene, t_frame);
 
-                mascot::draw(&canvas, 4, 7, mood, t);
-
-                // Title + plan badge (trimmed so it never runs into the buttons).
-                canvas.text(INFO_X, 4, "CLAUDE", pal::CYAN);
-                if let Some(plan) = snap.as_ref().and_then(|s| s.plan.as_deref()) {
-                    let plan: String = plan.to_uppercase().chars().take(PLAN_MAX_CHARS).collect();
-                    let bx = INFO_X + text_width("CLAUDE") + 3;
-                    canvas.px(bx - 1, 3, text_width(&plan) + 2, 7, pal::MAGENTA);
-                    canvas.text(bx, 4, &plan, pal::BG);
-                }
-                draw_button(&canvas, BTN_INFO, "?", over(BTN_INFO), pal::YELLOW);
-                draw_button(&canvas, BTN_REFRESH, "R", over(BTN_REFRESH), pal::CYAN);
-                draw_button(&canvas, BTN_CLOSE, "X", over(BTN_CLOSE), pal::RED);
-
-                // Status line: mood, loading, or error (alternating with the mood if we have data).
-                let (msg, col) = match (&error, has_data) {
-                    (Some(e), false) => (format!("! {}", e.short), pal::RED),
-                    (Some(e), true) if (t / 2.0) as i32 % 2 == 1 => (format!("! {}", e.short), pal::RED),
-                    (None, false) => {
-                        let dots = ".".repeat((t * 3.0) as usize % 4);
-                        (format!("> SYNCING{dots}"), pal::CYAN)
-                    }
-                    // When burnt out, alternate with the time the governing limit comes back.
-                    _ if mood == Mood::Dead && (t / 2.0) as i32 % 2 == 1 => {
-                        let gov = if self.shown_weekly > self.shown_session {
-                            weekly.as_ref().and_then(|w| w.resets_at()).map(|r| reset_clock(r, true))
-                        } else {
-                            session.as_ref().and_then(|w| w.resets_at()).map(|r| reset_clock(r, false))
+                // Upload the canvas only when a dot actually changed, then show it
+                // as one nearest-filtered quad.
+                {
+                    let pixels = self.canvas.pixels();
+                    if self.canvas_tex.is_none() || *pixels != self.last_pixels {
+                        self.last_pixels.clone_from(&pixels);
+                        let image = egui::ColorImage {
+                            size: [GRID_W as usize, GRID_H as usize],
+                            pixels: pixels.clone(),
                         };
-                        match gov {
-                            Some(at) => (format!("> BACK {at}"), accent),
-                            None => (mood_message(mood).to_string(), accent),
+                        match &mut self.canvas_tex {
+                            Some(tex) => tex.set(image, egui::TextureOptions::NEAREST),
+                            None => {
+                                self.canvas_tex = Some(ctx.load_texture(
+                                    "neongauge-canvas",
+                                    image,
+                                    egui::TextureOptions::NEAREST,
+                                ))
+                            }
                         }
                     }
-                    _ => (mood_message(mood).to_string(), accent),
-                };
-                let visible = mood != Mood::Panic || (t * 3.0) as i32 % 3 != 0;
-                if visible {
-                    canvas.text(INFO_X, 13, &msg, col);
                 }
-                if loading && has_data {
-                    // Tiny activity blip left of the buttons.
-                    if (t * 6.0) as i32 % 2 == 0 {
-                        canvas.px(BTN_INFO.0 - 2, 6, 1, 1, pal::CYAN);
-                    }
+                if let Some(tex) = &self.canvas_tex {
+                    let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+                    painter.image(tex.id(), rect, uv, Color32::WHITE);
                 }
+                draw_scanlines(&painter, origin, dot);
 
-                draw_limit_row(&canvas, 21, "5H", self.shown_session, session.as_ref(), false, t);
-                draw_limit_row(&canvas, 34, "7D", self.shown_weekly, weekly.as_ref(), true, t);
-
-                draw_scanlines(&canvas);
+                // Presenting a frame is the expensive part (mostly GPU driver
+                // time), so look ahead on the 30 fps grid and only wake up on
+                // the first tick whose picture differs from this one.
+                if !easing {
+                    let current = self.canvas.pixels();
+                    next_change_ticks = (1..=LOOKAHEAD_TICKS)
+                        .find(|&k| {
+                            draw_scene(&self.lookahead, &scene, t_frame + k as f32 * TICK);
+                            *self.lookahead.pixels() != *current
+                        })
+                        .unwrap_or(LOOKAHEAD_TICKS);
+                }
 
                 // Interaction.
                 if resp.clicked() {
@@ -957,8 +1117,12 @@ impl eframe::App for App {
         self.show_child_windows(ctx, snap.as_ref(), error.as_ref(), updated);
         self.apply_settings(ctx);
 
-        // ~30 fps for the animation.
-        ctx.request_repaint_after(Duration::from_millis(33));
+        // Wake at the next tick that changes the picture. egui subtracts its
+        // predicted frame time from the delay, so add it back to land on the tick.
+        let wake = (tick + next_change_ticks as f32) * TICK;
+        let delay = (wake - self.start.elapsed().as_secs_f32()).max(0.0)
+            + ctx.input(|i| i.predicted_dt);
+        ctx.request_repaint_after(Duration::from_secs_f32(delay));
     }
 }
 

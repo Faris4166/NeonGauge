@@ -57,6 +57,7 @@ cargo clippy --all-targets       # keep this warning-free
 
 **Persistence:**
 - Settings: `dirs::config_dir()/NeonGauge/settings.json`. Fields use `#[serde(default)]` so older files still load. `sanitized()` clamps hand-edited values.
+- Last good reading: `dirs::data_local_dir()/NeonGauge/last-usage.json` (`api::save_cache` / `load_cache`). At startup the worker shows it right away and, if it is newer than `refresh_secs`, waits out the rest of the interval before the first request, so restarts do not hit the API. On HTTP 429 the worker waits `Retry-After`, or 2, 4, 8 minutes and so on up to 15.
 - History: `dirs::data_local_dir()/NeonGauge/history.csv`, one `ts,session,weekly` row per reading. Readings are de-duplicated within 15 minutes, and rows older than 35 days are pruned on load.
 
 ## Gotchas
@@ -64,4 +65,5 @@ cargo clippy --all-targets       # keep this warning-free
 - The pixel font only has `0-9`, `A-Z` and `% : . ! ? - + / >` plus space. Any other character is silently skipped, and all text is uppercased.
 - The plan badge is truncated to 3 characters (`PLAN_MAX_CHARS`) so it does not overlap the `?` button.
 - The `Dockerfile` still references the binary as `claude-limit`, but the crate builds `neongauge`.
+- Icons are not drawn in code: `assets/icon.png` (window, 256 px), `assets/icon-tray.png` (64 px) and `assets/icon.ico` (exe, embedded by `build.rs` through `assets/neongauge.rc`) are renders of `assets/logo.svg`. Re-render all three when the logo changes.
 - `installer/Product.wxs` (WiX v4 MSI) and `dist/` exist locally but are gitignored.
