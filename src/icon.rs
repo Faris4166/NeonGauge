@@ -3,7 +3,6 @@
 use eframe::egui::IconData;
 
 const GRID: usize = 32; // logical pixels per side
-const SCALE: usize = 4; // each logical pixel becomes a 4x4 block -> 128x128
 const LEVEL: f32 = 0.62;
 
 const BG: [u8; 4] = [11, 11, 20, 255];
@@ -60,13 +59,20 @@ fn pixel(x: usize, y: usize) -> [u8; 4] {
     BG
 }
 
+/// Window icon: each logical pixel becomes a 4x4 block -> 128x128.
 pub fn icon() -> IconData {
-    let size = GRID * SCALE;
+    rgba(4)
+}
+
+/// The icon at `scale` device pixels per logical pixel (1 -> 32x32, for the tray).
+pub fn rgba(scale: usize) -> IconData {
+    let scale = scale.max(1);
+    let size = GRID * scale;
     let mut rgba = vec![0u8; size * size * 4];
     for y in 0..size {
         for x in 0..size {
             let i = (y * size + x) * 4;
-            rgba[i..i + 4].copy_from_slice(&pixel(x / SCALE, y / SCALE));
+            rgba[i..i + 4].copy_from_slice(&pixel(x / scale, y / scale));
         }
     }
     IconData {

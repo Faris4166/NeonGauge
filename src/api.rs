@@ -88,15 +88,50 @@ fn credentials_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".claude").join(".credentials.json"))
 }
 
-fn load_oauth() -> Result<OAuth, FetchError> {
+/// macOS: Claude Code keeps the credentials JSON in the login Keychain.
+/// The first read may show a Keychain prompt; choose "Always Allow".
+#[cfg(target_os = "macos")]
+fn keychain_credentials() -> Option<String> {
+    let out = std::process::Command::new("security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_credentials() -> Option<String> {
+    None
+}
+
+fn read_credentials() -> Result<String, FetchError> {
+    // An explicit config dir wins; otherwise prefer the Keychain on macOS.
+    if env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+        if let Some(raw) = keychain_credentials() {
+            return Ok(raw);
+        }
+    }
     let path = credentials_path()
         .ok_or_else(|| FetchError::new("NO HOME DIR", "Could not locate the home directory"))?;
-    let raw = fs::read_to_string(&path).map_err(|_| {
+    fs::read_to_string(&path).map_err(|_| {
+        let where_ = if cfg!(target_os = "macos") {
+            format!("in the Keychain (\"Claude Code-credentials\") or at {}", path.display())
+        } else {
+            format!("at {}", path.display())
+        };
         FetchError::new(
             "NO LOGIN",
-            format!("No credentials at {} - log in to Claude Code first", path.display()),
+            format!("No credentials {where_} - log in to Claude Code first"),
         )
-    })?;
+    })
+}
+
+fn load_oauth() -> Result<OAuth, FetchError> {
+    let raw = read_credentials()?;
     let file: CredentialsFile = serde_json::from_str(&raw)
         .map_err(|e| FetchError::new("BAD CREDS", format!("Could not parse credentials: {e}")))?;
     let oauth = file.claude_ai_oauth.ok_or_else(|| {
