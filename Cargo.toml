@@ -1,6 +1,6 @@
 [package]
-name = "claude-limit"
-version = "0.2.0"
+name = "neongauge"
+version = "0.3.0"
 edition = "2021"
 description = "Tiny pixel-art desktop tab that shows your Claude usage limits"
 

@@ -1,0 +1,27 @@
+# Run NeonGauge in a container and show the window on the host display.
+#
+#   Linux (X11):      xhost +local:docker && docker compose up --build
+#   Windows (WSLg):   run from a WSL2 shell:  docker compose up --build
+#
+# Preview a mood without a token:  CLAUDE_LIMIT_DEMO=sweep docker compose up
+services:
+  neongauge:
+    build:
+      context: .
+      target: runtime
+    image: neongauge:latest
+    container_name: neongauge
+    environment:
+      DISPLAY: ${DISPLAY:-:0}
+      WAYLAND_DISPLAY: ${WAYLAND_DISPLAY:-}
+      XDG_RUNTIME_DIR: /tmp/runtime
+      CLAUDE_CONFIG_DIR: /home/app/.claude
+      CLAUDE_LIMIT_DEMO: ${CLAUDE_LIMIT_DEMO:-}
+    volumes:
+      # X11 socket
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      # Claude Code token (read only; the app never writes it)
+      - ${CLAUDE_HOME:-~/.claude}:/home/app/.claude:ro
+      # WSLg runtime dir (Wayland/PulseAudio). On plain Linux point XDG_RUNTIME_HOST at $XDG_RUNTIME_DIR
+      - ${XDG_RUNTIME_HOST:-/mnt/wslg/runtime-dir}:/tmp/runtime
+    restart: unless-stopped

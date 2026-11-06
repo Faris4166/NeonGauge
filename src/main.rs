@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod icon;
 mod mascot;
 mod pixel;
 
@@ -47,7 +48,7 @@ struct App {
     shown_session: f32,
     shown_weekly: f32,
     pinned: bool,
-    /// CLAUDE_LIMIT_DEMO=<number> pins the session percentage, =sweep cycles 0..100.
+    /// NEONGAUGE_DEMO=<number> pins the session percentage, =sweep cycles 0..100.
     demo: Option<String>,
     /// pixels_per_point the window was last sized for.
     sized_for: f32,
@@ -122,7 +123,9 @@ impl App {
             shown_session: 0.0,
             shown_weekly: 0.0,
             pinned: true,
-            demo: std::env::var("CLAUDE_LIMIT_DEMO").ok(),
+            demo: std::env::var("NEONGAUGE_DEMO")
+                .or_else(|_| std::env::var("CLAUDE_LIMIT_DEMO"))
+                .ok(),
             sized_for: 0.0,
         }
     }
@@ -458,7 +461,8 @@ impl eframe::App for App {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Claude Limit")
+            .with_title("NeonGauge")
+            .with_icon(icon::icon())
             .with_inner_size([GRID_W as f32 * DOT, GRID_H as f32 * DOT])
             .with_decorations(false)
             .with_resizable(false)
@@ -466,7 +470,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "Claude Limit",
+        "NeonGauge",
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )

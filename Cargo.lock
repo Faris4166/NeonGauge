@@ -638,18 +638,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "claude-limit"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "dirs",
- "eframe",
- "reqwest",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "clipboard-win"
 version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2103,6 +2091,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "neongauge"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "eframe",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
