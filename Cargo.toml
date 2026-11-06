@@ -1,0 +1,18 @@
+[package]
+name = "claude-limit"
+version = "0.2.0"
+edition = "2021"
+description = "Tiny pixel-art desktop tab that shows your Claude usage limits"
+
+[dependencies]
+eframe = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+dirs = "5"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
